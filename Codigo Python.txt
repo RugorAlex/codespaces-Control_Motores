@@ -1,0 +1,132 @@
+# developed by Edwin Ruano G.
+import tkinter as tk
+from tkinter import ttk
+import serial, threading, queue, time
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+COM_PORT = "COM3"
+BAUDRATE = 115200
+Ts_GUI    = 0.1     # Periodo de actualización del GUI [s]
+data_q    = queue.Queue()
+
+def serial_reader(ser, q):
+    """Lee pares <deseada, medida> y los envía a la cola."""
+    while True:
+        try:
+            line = ser.readline().decode('ascii').strip()
+            if not line: 
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                des, mea = map(float, parts)
+                q.put((time.time(), des, mea))
+        except:
+            pass
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Control RPM Motor (OL/CL)")
+
+        # Serial
+        self.ser = serial.Serial(COM_PORT, BAUDRATE, timeout=0.1)
+        threading.Thread(target=serial_reader, args=(self.ser, data_q), daemon=True).start()
+
+        # Variables
+        self.mode_var = tk.StringVar(value="CL")
+        self.rpm_var  = tk.IntVar(value=0)
+
+        # Parámetro filtro IIR
+        self.alpha = 0.1
+
+        # Datos de señal
+        self.t0          = time.time()
+        self.ts          = []
+        self.des_data    = []
+        self.raw_mea     = []  # datos crudos
+        self.filt_mea    = []  # datos filtrados
+
+        # Construcción GUI
+        frm = ttk.Frame(root); frm.pack(fill="x", padx=10, pady=5)
+        ttk.Label(frm, text="Modo:").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(frm, text="OL", value="OL", variable=self.mode_var).grid(row=0, column=1)
+        ttk.Radiobutton(frm, text="CL", value="CL", variable=self.mode_var).grid(row=0, column=2)
+
+        ttk.Label(frm, text="RPM:").grid(row=1, column=0, sticky="w")
+        self.slider = ttk.Scale(frm, from_=0, to=1500, orient="horizontal",
+                                variable=self.rpm_var, command=self.on_slider_change)
+        self.slider.grid(row=1, column=1, columnspan=2, sticky="we", padx=5)
+        self.rpm_label = ttk.Label(frm, text="0 RPM")
+        self.rpm_label.grid(row=1, column=3, sticky="w", padx=5)
+
+        btn = ttk.Button(frm, text="Enviar", command=self.send_cmd)
+        btn.grid(row=0, column=4, rowspan=2, padx=10)
+
+        self.fig = Figure(figsize=(6,3), dpi=100)
+        self.ax  = self.fig.add_subplot(111)
+        self.ax.set_title("RPM requerida vs. RPM medida (IIR)")
+        self.ax.set_xlabel("Tiempo (s)")
+        self.ax.set_ylabel("RPM")
+        self.line_des, = self.ax.plot([], [], label="RPM_Requerida")
+        self.line_mea, = self.ax.plot([], [], label="RPM_Medida")
+        self.ax.legend(loc="upper right")
+
+        canvas = FigureCanvasTkAgg(self.fig, root)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        root.after(int(Ts_GUI*1000), self.update_plot)
+
+    def on_slider_change(self, val):
+        rpm = int(float(val))
+        self.rpm_label.config(text=f"{rpm} RPM")
+
+    def send_cmd(self):
+        mode = self.mode_var.get()
+        rpm  = self.rpm_var.get()
+        self.ser.write((mode + "\n").encode())
+        time.sleep(0.05)
+        self.ser.write((f"{rpm}\n").encode())
+
+    def update_plot(self):
+        # Extraer datos de la cola
+        while not data_q.empty():
+            t, d, m = data_q.get()
+            self.ts.append(t - self.t0)
+            self.des_data.append(d)
+            self.raw_mea.append(m)
+
+            # aplicar filtro IIR
+            if not self.filt_mea:
+                self.filt_mea.append(m)
+            else:
+                y_prev = self.filt_mea[-1]
+                y_new  = self.alpha*m + (1-self.alpha)*y_prev
+                self.filt_mea.append(y_new)
+
+        # recortar últimos 200 puntos
+        if len(self.ts) > 200:
+            self.ts       = self.ts[-200:]
+            self.des_data = self.des_data[-200:]
+            self.filt_mea = self.filt_mea[-200:]
+
+        # actualizar gráfica
+        self.line_des.set_data(self.ts, self.des_data)
+        self.line_mea.set_data(self.ts, self.filt_mea)
+        if self.ts:
+            self.ax.set_xlim(self.ts[0], self.ts[-1])
+            ally = self.des_data + self.filt_mea
+            ymin = max(0, min(ally)-50)
+            ymax = max(ally)+50
+            self.ax.set_ylim(ymin, ymax)
+        self.fig.canvas.draw()
+
+        # reprogramar
+        self.root.after(int(Ts_GUI*1000), self.update_plot)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = App(root)
+    root.mainloop()
